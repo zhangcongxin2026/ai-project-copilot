@@ -2,7 +2,7 @@ import axios from 'axios'
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 60000,
+  timeout: 120000,
 })
 
 export interface WorkflowRequest {
@@ -22,20 +22,46 @@ export interface WorkflowResult {
     }
   }>
   errorMessage?: string
+  progress: number
+  taskCount: number
+  logs: string[]
+  startedAt: string
+}
+
+export interface WorkflowStartResponse {
+  workflowId: string
+  status: string
 }
 
 export const copilotApi = {
+  /**
+   * 启动异步工作流
+   */
+  async startWorkflow(input: string): Promise<WorkflowStartResponse> {
+    const response = await api.post<WorkflowStartResponse>('/workflow', { input })
+    return response.data
+  },
+
+  /**
+   * 同步执行工作流（适合简单测试）
+   */
   async runWorkflow(input: string): Promise<WorkflowResult> {
     const response = await api.post<WorkflowResult>('/workflow/sync', { input })
     return response.data
   },
 
+  /**
+   * 获取工作流状态
+   */
   async getWorkflowStatus(id: string): Promise<WorkflowResult> {
     const response = await api.get<WorkflowResult>(`/workflow/${id}`)
     return response.data
   },
 
-  async healthCheck(): Promise<{ status: string }> {
+  /**
+   * 健康检查
+   */
+  async healthCheck(): Promise<{ status: string; service: string }> {
     const response = await api.get('/health')
     return response.data
   },

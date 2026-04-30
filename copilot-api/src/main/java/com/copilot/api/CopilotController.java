@@ -8,6 +8,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * REST API 控制器
@@ -21,14 +22,17 @@ public class CopilotController {
     private final Orchestrator orchestrator;
 
     /**
-     * 提交需求并启动工作流
+     * 提交需求并启动工作流（异步）
      */
     @PostMapping("/workflow")
     public ResponseEntity<Map<String, String>> submitWorkflow(@RequestBody WorkflowRequest request) {
         String workflowId = "wf-" + System.currentTimeMillis();
 
         // 异步执行
-        orchestrator.runAsync(request.getInput());
+        CompletableFuture<WorkflowResult> future = orchestrator.runAsync(request.getInput());
+
+        // 存储 future 以便后续获取结果
+        orchestrator.storeWorkflow(workflowId, future);
 
         return ResponseEntity.ok(Map.of(
                 "workflowId", workflowId,
