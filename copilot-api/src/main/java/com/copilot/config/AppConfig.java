@@ -83,4 +83,9 @@ public class AppConfig {
     public TestAgent testAgent(LlmRouter llmRouter) {
         return new TestAgent(llmRouter);
     }
+
+    @Bean
+    public ReviewAgent reviewAgent(LlmRouter llmRouter) {
+        return new ReviewAgent(llmRouter);
+    }
 }

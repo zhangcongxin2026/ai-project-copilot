@@ -102,14 +102,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue'
+import { ref, computed, onUnmounted, nextTick } from 'vue'
 import { copilotApi, type WorkflowResult } from '@/api/copilot'
 import { Loading } from '@element-plus/icons-vue'
+import { Client } from '@stomp/stompjs'
+import SockJS from 'sockjs-client/dist/sockjs'
 
 const inputText = ref('')
 const running = ref(false)
 const workflowResult = ref<WorkflowResult | null>(null)
-const pollTimer = ref<number | null>(null)
 const logContainer = ref<HTMLElement | null>(null)
 
 // 实时状态
@@ -119,6 +120,8 @@ const logs = ref<string[]>([])
 const startTime = ref<number | null>(null)
 const elapsedTime = ref(0)
 const timer = ref<number | null>(null)
+const currentWorkflowId = ref<string | null>(null)
+let stompClient: Client | null = null
 
 const statusText = computed(() => {
   if (!workflowResult.value) return '等待开始'
@@ -127,6 +130,7 @@ const statusText = computed(() => {
     case 'PARSING_REQUIREMENT': return '解析需求中...'
     case 'GENERATING_TASKS': return '生成任务中...'
     case 'GENERATING_CODE': return '生成代码中...'
+    case 'REVIEWING_CODE': return '代码审查中...'
     case 'COMPLETED': return '已完成'
     case 'FAILED': return '执行失败'
     default: return '未知状态'
@@ -148,7 +152,6 @@ const progressStatus = computed(() => {
   return undefined
 })
 
-// 启动计时器
 const startTimer = () => {
   startTime.value = Date.now()
   timer.value = window.setInterval(() => {
@@ -158,7 +161,6 @@ const startTimer = () => {
   }, 1000)
 }
 
-// 停止计时器
 const stopTimer = () => {
   if (timer.value) {
     clearInterval(timer.value)
@@ -166,66 +168,92 @@ const stopTimer = () => {
   }
 }
 
-// 更新状态
 const updateStatus = (result: WorkflowResult) => {
   workflowResult.value = result
   progress.value = result.progress || 0
   taskCount.value = result.taskCount || 0
   logs.value = result.logs || []
-  scrollToBottom()
+  nextTick(scrollToBottom)
 }
 
-// 滚动到底部
 const scrollToBottom = () => {
-  setTimeout(() => {
-    if (logContainer.value) {
-      logContainer.value.scrollTop = logContainer.value.scrollHeight
-    }
-  }, 100)
+  if (logContainer.value) {
+    logContainer.value.scrollTop = logContainer.value.scrollHeight
+  }
+}
+
+const connectWebSocket = (workflowId: string) => {
+  stompClient = new Client({
+    webSocketFactory: () => new SockJS('/ws'),
+    reconnectDelay: 3000,
+    onConnect: () => {
+      stompClient?.subscribe(`/topic/workflow/${workflowId}`, (message) => {
+        try {
+          const result: WorkflowResult = JSON.parse(message.body)
+          updateStatus(result)
+          if (result.status === 'COMPLETED' || result.status === 'FAILED') {
+            running.value = false
+            stopTimer()
+            disconnectWebSocket()
+          }
+        } catch (e) {
+          console.error('Failed to parse WebSocket message:', e)
+        }
+      })
+    },
+    onStompError: (frame) => {
+      console.error('STOMP error:', frame.headers['message'])
+    },
+  })
+  stompClient.activate()
+}
+
+const disconnectWebSocket = () => {
+  if (stompClient) {
+    stompClient.deactivate()
+    stompClient = null
+  }
 }
 
 const runWorkflow = async () => {
-  if (!inputText.value.trim()) {
-    return
-  }
+  if (!inputText.value.trim()) return
 
   running.value = true
   progress.value = 0
   logs.value = []
   startTime.value = null
   elapsedTime.value = 0
+  workflowResult.value = null
   startTimer()
 
   try {
-    // 启动异步工作流
-    const { workflowId } = await (await fetch('/api/workflow', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input: inputText.value })
-    })).json()
+    const { workflowId } = await copilotApi.startWorkflow(inputText.value)
+    currentWorkflowId.value = workflowId
 
-    // 轮询获取状态
-    const pollStatus = async () => {
+    // Connect WebSocket for real-time updates
+    connectWebSocket(workflowId)
+
+    // Fallback polling in case WebSocket fails
+    const fallbackPoll = async () => {
+      if (!running.value || !currentWorkflowId.value) return
       try {
         const result = await copilotApi.getWorkflowStatus(workflowId)
         updateStatus(result)
-
         if (result.status === 'COMPLETED' || result.status === 'FAILED') {
           running.value = false
           stopTimer()
-          if (pollTimer.value) clearInterval(pollTimer.value)
-        } else {
-          // 继续轮询
-          pollTimer.value = window.setTimeout(pollStatus, 1000)
+          disconnectWebSocket()
+          return
         }
-      } catch (error) {
-        console.error('Polling failed:', error)
-        running.value = false
-        stopTimer()
+      } catch (e) {
+        // ignore poll errors when WS is active
+      }
+      if (running.value) {
+        setTimeout(fallbackPoll, 3000)
       }
     }
-
-    pollStatus()
+    // Start fallback poll after 5s if WS hasn't completed
+    setTimeout(fallbackPoll, 5000)
   } catch (error) {
     console.error('Workflow failed:', error)
     running.value = false
@@ -239,7 +267,7 @@ const runWorkflow = async () => {
       progress: 0,
       taskCount: 0,
       logs: [],
-      startedAt: new Date().toISOString()
+      startedAt: new Date().toISOString(),
     }
   }
 }
@@ -252,16 +280,14 @@ const clearInput = () => {
   logs.value = []
   elapsedTime.value = 0
   running.value = false
+  currentWorkflowId.value = null
   stopTimer()
-  if (pollTimer.value) {
-    clearTimeout(pollTimer.value)
-    pollTimer.value = null
-  }
+  disconnectWebSocket()
 }
 
 onUnmounted(() => {
   stopTimer()
-  if (pollTimer.value) clearTimeout(pollTimer.value)
+  disconnectWebSocket()
 })
 
 const getResultType = (result: { success: boolean }) => {

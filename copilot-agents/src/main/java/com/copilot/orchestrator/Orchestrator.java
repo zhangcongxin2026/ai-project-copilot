@@ -3,10 +3,12 @@ package com.copilot.orchestrator;
 import com.copilot.agent.AgentResult;
 import com.copilot.agent.CodeAgent;
 import com.copilot.agent.RequirementAgent;
+import com.copilot.agent.ReviewAgent;
 import com.copilot.agent.TaskAgent;
 import com.copilot.model.Task;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -26,13 +28,18 @@ public class Orchestrator {
     private final RequirementAgent requirementAgent;
     private final TaskAgent taskAgent;
     private final CodeAgent codeAgent;
+    private final ReviewAgent reviewAgent;
+    private final SimpMessagingTemplate messagingTemplate;
     private final ConcurrentMap<String, WorkflowInstance> workflows = new ConcurrentHashMap<>();
     private final ExecutorService executorService;
 
-    public Orchestrator(RequirementAgent requirementAgent, TaskAgent taskAgent, CodeAgent codeAgent) {
+    public Orchestrator(RequirementAgent requirementAgent, TaskAgent taskAgent, CodeAgent codeAgent,
+                        ReviewAgent reviewAgent, SimpMessagingTemplate messagingTemplate) {
         this.requirementAgent = requirementAgent;
         this.taskAgent = taskAgent;
         this.codeAgent = codeAgent;
+        this.reviewAgent = reviewAgent;
+        this.messagingTemplate = messagingTemplate;
         // 创建固定大小的线程池用于并行执行任务
         this.executorService = Executors.newFixedThreadPool(
                 Runtime.getRuntime().availableProcessors() * 2,
@@ -45,6 +52,13 @@ public class Orchestrator {
      */
     public CompletableFuture<WorkflowResult> runAsync(String requirementInput) {
         String workflowId = "wf-" + System.currentTimeMillis();
+        return runAsync(workflowId, requirementInput);
+    }
+
+    /**
+     * 异步执行工作流（指定 ID）
+     */
+    public CompletableFuture<WorkflowResult> runAsync(String workflowId, String requirementInput) {
         WorkflowInstance workflow = new WorkflowInstance(workflowId, requirementInput);
         workflows.put(workflowId, workflow);
 
@@ -52,6 +66,15 @@ public class Orchestrator {
             () -> runFullWorkflowInternal(requirementInput, workflow),
             executorService
         );
+
+        // Update status when done
+        future.whenComplete((result, error) -> {
+            if (result != null) {
+                workflow.updateStatus(result.getStatus());
+                workflow.setProgress(result.getProgress());
+                broadcastUpdate(workflowId);
+            }
+        });
 
         return future;
     }
@@ -84,16 +107,19 @@ public class Orchestrator {
             // 步骤 1: 需求解析
             workflow.updateStatus(WorkflowStatus.PARSING_REQUIREMENT);
             workflow.setProgress(10);
+            broadcastUpdate(workflow.getId());
             AgentResult requirementResult = requirementAgent.execute(requirementInput);
             if (!requirementResult.isSuccess()) {
                 throw new RuntimeException("需求解析失败：" + requirementResult.getErrorMessage());
             }
             workflow.addStepResult("requirement", requirementResult);
             workflow.setProgress(25);
+            broadcastUpdate(workflow.getId());
 
             // 步骤 2: 任务分解
             workflow.updateStatus(WorkflowStatus.GENERATING_TASKS);
             workflow.setProgress(35);
+            broadcastUpdate(workflow.getId());
             AgentResult taskResult = taskAgent.execute(requirementResult.getOutput());
             if (!taskResult.isSuccess()) {
                 throw new RuntimeException("任务生成失败：" + taskResult.getErrorMessage());
@@ -104,18 +130,40 @@ public class Orchestrator {
             List<Task> tasks = parseTasks(taskResult.getOutput());
             workflow.setTaskCount(tasks.size());
             workflow.setProgress(50);
+            broadcastUpdate(workflow.getId());
 
             // 步骤 3: 代码生成（并行执行，处理依赖）
             workflow.updateStatus(WorkflowStatus.GENERATING_CODE);
+            broadcastUpdate(workflow.getId());
             executeTasksWithDependencies(workflow, tasks);
+
+            // 步骤 4: 代码审查
+            workflow.updateStatus(WorkflowStatus.REVIEWING_CODE);
+            workflow.setProgress(85);
+            broadcastUpdate(workflow.getId());
+            StringBuilder allCode = new StringBuilder();
+            for (StepResult sr : workflow.getStepResults()) {
+                if (sr.getStepName().startsWith("code-") && sr.getResult().isSuccess()) {
+                    allCode.append(sr.getResult().getOutput()).append("\n\n");
+                }
+            }
+            if (allCode.length() > 0) {
+                AgentResult reviewResult = reviewAgent.execute(
+                    "请审查以下代码：\n" + allCode
+                );
+                workflow.addStepResult("review", reviewResult);
+            }
+            workflow.setProgress(95);
 
             workflow.updateStatus(WorkflowStatus.COMPLETED);
             workflow.setProgress(100);
+            broadcastUpdate(workflow.getId());
             log.info("Workflow completed: {}", workflow.getId());
 
         } catch (Exception e) {
             workflow.updateStatus(WorkflowStatus.FAILED);
             workflow.setErrorMessage(e.getMessage());
+            broadcastUpdate(workflow.getId());
             log.error("Workflow failed: {}", workflow.getId(), e);
         }
 
@@ -143,6 +191,30 @@ public class Orchestrator {
             return null;
         }
         return workflow.toResult();
+    }
+
+    /**
+     * 获取所有工作流历史
+     */
+    public List<WorkflowResult> getAllWorkflows() {
+        return workflows.values().stream()
+                .map(WorkflowInstance::toResult)
+                .sorted((a, b) -> b.getStartedAt().compareTo(a.getStartedAt()))
+                .collect(java.util.stream.Collectors.toList());
+    }
+
+    /**
+     * 广播工作流状态更新
+     */
+    private void broadcastUpdate(String workflowId) {
+        WorkflowInstance workflow = workflows.get(workflowId);
+        if (workflow != null && messagingTemplate != null) {
+            try {
+                messagingTemplate.convertAndSend("/topic/workflow/" + workflowId, workflow.toResult());
+            } catch (Exception e) {
+                log.warn("Failed to broadcast workflow update: {}", workflowId, e);
+            }
+        }
     }
 
     /**
@@ -218,7 +290,7 @@ public class Orchestrator {
                         completedTasks.add(taskId);
 
                         int count = processedCount.incrementAndGet();
-                        int progress = 50 + (count * 50 / tasks.size());
+                        int progress = 50 + (count * 35 / tasks.size());
                         workflow.setProgress(progress);
 
                         log.info("Task completed: {} ({}/{})", taskId, count, tasks.size());
@@ -375,6 +447,7 @@ public class Orchestrator {
         PARSING_REQUIREMENT,
         GENERATING_TASKS,
         GENERATING_CODE,
+        REVIEWING_CODE,
         COMPLETED,
         FAILED
     }

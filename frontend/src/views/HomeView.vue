@@ -26,7 +26,7 @@
           </el-col>
           <el-col :span="6">
             <el-card shadow="hover" class="feature-card">
-              <el-icon :size="40" color="#E6A23C"><Code /></el-icon>
+              <el-icon :size="40" color="#E6A23C"><Monitor /></el-icon>
               <h4>代码生成</h4>
               <p>根据任务描述生成高质量代码</p>
             </el-card>
@@ -54,7 +54,7 @@
 
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
-import { Document, List, Code, Finished } from '@element-plus/icons-vue'
+import { Document, List, Monitor, Finished } from '@element-plus/icons-vue'
 
 const router = useRouter()
 
